@@ -27,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
+import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
 /** Per-host-process client. UI hot path remains RAM lookup + enqueue only. */
@@ -54,6 +55,7 @@ public final class TranslationClient {
     private volatile boolean bound;
     private boolean flushScheduled;
     private boolean rebindScheduled;
+    private boolean helloRequested;
 
     private TranslationClient(Context context) {
         Context application = context.getApplicationContext();
@@ -76,6 +78,13 @@ public final class TranslationClient {
             }
         }
         return local;
+    }
+
+    /** Called once from Application.attach so diagnostics can distinguish injection from text coverage. */
+    public void reportHookLoaded() {
+        synchronized (this) { helloRequested = true; }
+        ensureBound();
+        if (bound) ioHandler.post(this::sendHello);
     }
 
     public String peek(String source) {
@@ -104,6 +113,26 @@ public final class TranslationClient {
             return;
         }
         ensureBound();
+    }
+
+    private void sendHello() {
+        Messenger target = service;
+        if (target == null) return;
+        synchronized (this) {
+            if (!helloRequested) return;
+        }
+        Message msg = Message.obtain(null, Protocol.MSG_HOOK_HELLO);
+        Bundle data = new Bundle();
+        data.putString(Protocol.KEY_HOST_PACKAGE, hostPackage);
+        msg.setData(data);
+        try {
+            target.send(msg);
+            synchronized (this) { helloRequested = false; }
+        } catch (RemoteException e) {
+            service = null;
+            bound = false;
+            scheduleRebind();
+        }
     }
 
     private void scheduleFlushLocked() {
@@ -175,7 +204,6 @@ public final class TranslationClient {
             if (translated == null || translated.isEmpty()) translated = source;
             final List<PendingTarget> targets;
             synchronized (lock) {
-                // Cache even unchanged results: language detection may legitimately decide OTHER.
                 cache.put(source, translated);
                 targets = waiters.remove(source);
             }
@@ -215,10 +243,12 @@ public final class TranslationClient {
                 boolean ok = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE);
                 if (!ok) {
                     binding = false;
+                    XposedBridge.log("[LiteTrans] bindService=false host=" + hostPackage);
                     scheduleRebind();
                 }
-            } catch (Throwable ignored) {
+            } catch (Throwable t) {
                 binding = false;
+                XposedBridge.log("[LiteTrans] bindService failed host=" + hostPackage + " error=" + t);
                 scheduleRebind();
             }
         }
@@ -240,7 +270,10 @@ public final class TranslationClient {
             service = new Messenger(binder);
             binding = false;
             bound = true;
-            ioHandler.post(TranslationClient.this::flushNow);
+            ioHandler.post(() -> {
+                sendHello();
+                flushNow();
+            });
         }
         @Override public void onServiceDisconnected(ComponentName name) { markDead(); }
         @Override public void onBindingDied(ComponentName name) { markDead(); }
