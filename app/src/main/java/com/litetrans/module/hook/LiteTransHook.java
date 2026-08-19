@@ -18,7 +18,8 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Minimal LSPosed hook: TextView only, zero synchronous translation and no Dex scan.
+ * Lightweight TextView hook with compatibility fallbacks.
+ * Hooks only the framework TextView class; no Dex scan and no synchronous translation.
  */
 public final class LiteTransHook implements IXposedHookLoadPackage {
     static final String BYPASS_KEY = "litetrans:bypass";
@@ -26,69 +27,96 @@ public final class LiteTransHook implements IXposedHookLoadPackage {
     static final String SOURCE_KEY = "litetrans:source";
 
     private static final AtomicLong GENERATION = new AtomicLong(1L);
+    private static final ThreadLocal<Integer> SET_TEXT_DEPTH = new ThreadLocal<>();
+
+    private static final XC_MethodHook TEXT_HOOK = new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            if (!(param.thisObject instanceof TextView)) return;
+            if (param.args == null || param.args.length == 0 || !(param.args[0] instanceof CharSequence)) return;
+
+            int depth = currentDepth();
+            SET_TEXT_DEPTH.set(depth + 1);
+            if (depth > 0) return;
+
+            TextView view = (TextView) param.thisObject;
+            try {
+                Object bypass = XposedHelpers.getAdditionalInstanceField(view, BYPASS_KEY);
+                if (Boolean.TRUE.equals(bypass)) {
+                    XposedHelpers.removeAdditionalInstanceField(view, BYPASS_KEY);
+                    return;
+                }
+
+                long generation = GENERATION.getAndIncrement();
+                XposedHelpers.setAdditionalInstanceField(view, GENERATION_KEY, generation);
+                XposedHelpers.removeAdditionalInstanceField(view, SOURCE_KEY);
+
+                CharSequence original = (CharSequence) param.args[0];
+                if (original == null || original.length() == 0) return;
+                if (view instanceof EditText || original instanceof Editable) return;
+                if (param.args.length > 1 && param.args[1] == TextView.BufferType.EDITABLE) return;
+
+                TextEnvelope envelope = TextEnvelope.from(original);
+                if (!QuickFilter.shouldTranslate(view, original, envelope.core)) return;
+
+                TranslationClient client = TranslationClient.get(view.getContext());
+                String cached = client.peek(envelope.core);
+                XposedHelpers.setAdditionalInstanceField(view, SOURCE_KEY, envelope.core);
+
+                if (cached != null) {
+                    if (!cached.equals(envelope.core)) {
+                        param.args[0] = StyledText.rebuild(original, envelope.wrap(cached));
+                    }
+                    return;
+                }
+
+                client.request(envelope.core, view, generation, original, envelope);
+            } catch (Throwable ignored) {
+                // Never destabilize the host app.
+            }
+        }
+
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) {
+            if (param.args == null || param.args.length == 0 || !(param.args[0] instanceof CharSequence)) return;
+            int depth = currentDepth();
+            if (depth <= 1) SET_TEXT_DEPTH.remove();
+            else SET_TEXT_DEPTH.set(depth - 1);
+        }
+    };
+
+    private static int currentDepth() {
+        Integer value = SET_TEXT_DEPTH.get();
+        return value == null ? 0 : value;
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (lpparam == null || lpparam.packageName == null) return;
         if (Protocol.MODULE_PACKAGE.equals(lpparam.packageName)) return;
-
-        // Hard safety exclusions. The module is intended for user apps, not boot-critical UI.
         if ("android".equals(lpparam.packageName)
                 || "com.android.systemui".equals(lpparam.packageName)
-                || lpparam.packageName.contains("inputmethod")) {
-            return;
-        }
+                || lpparam.packageName.contains("inputmethod")) return;
 
+        int installed = 0;
+        installed += tryHook(lpparam, new Object[]{CharSequence.class, TEXT_HOOK});
+        installed += tryHook(lpparam, new Object[]{CharSequence.class, TextView.BufferType.class, TEXT_HOOK});
+        installed += tryHook(lpparam, new Object[]{CharSequence.class, TextView.BufferType.class,
+                boolean.class, int.class, TEXT_HOOK});
+
+        XposedBridge.log("[LiteTrans] " + lpparam.packageName + " TextView setText hooks=" + installed);
+    }
+
+    private static int tryHook(XC_LoadPackage.LoadPackageParam lpparam, Object[] signature) {
         try {
             XposedHelpers.findAndHookMethod(
                     "android.widget.TextView",
                     lpparam.classLoader,
                     "setText",
-                    CharSequence.class,
-                    TextView.BufferType.class,
-                    boolean.class,
-                    int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!(param.thisObject instanceof TextView)) return;
-                            TextView view = (TextView) param.thisObject;
-
-                            Object bypass = XposedHelpers.getAdditionalInstanceField(view, BYPASS_KEY);
-                            if (Boolean.TRUE.equals(bypass)) {
-                                XposedHelpers.removeAdditionalInstanceField(view, BYPASS_KEY);
-                                return;
-                            }
-
-                            // Every host setText invalidates older async results, even if this text is skipped.
-                            long generation = GENERATION.getAndIncrement();
-                            XposedHelpers.setAdditionalInstanceField(view, GENERATION_KEY, generation);
-                            XposedHelpers.removeAdditionalInstanceField(view, SOURCE_KEY);
-
-                            CharSequence original = (CharSequence) param.args[0];
-                            if (original == null || original.length() == 0) return;
-                            if (view instanceof EditText || original instanceof Editable) return;
-                            if (param.args[1] == TextView.BufferType.EDITABLE) return;
-
-                            TextEnvelope envelope = TextEnvelope.from(original);
-                            if (!QuickFilter.shouldTranslate(view, original, envelope.core)) return;
-
-                            TranslationClient client = TranslationClient.get(view.getContext());
-                            String cached = client.peek(envelope.core);
-                            XposedHelpers.setAdditionalInstanceField(view, SOURCE_KEY, envelope.core);
-
-                            if (cached != null) {
-                                param.args[0] = StyledText.rebuild(original, envelope.wrap(cached));
-                                return;
-                            }
-
-                            // Do not block this setText call. The host app renders immediately.
-                            client.request(envelope.core, view, generation, original, envelope);
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            XposedBridge.log("[LiteTrans] TextView hook failed in " + lpparam.packageName + ": " + t);
+                    signature);
+            return 1;
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 }
