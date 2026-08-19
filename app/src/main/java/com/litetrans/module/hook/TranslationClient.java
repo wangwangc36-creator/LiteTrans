@@ -29,24 +29,21 @@ import java.util.Map;
 
 import de.robv.android.xposed.XposedHelpers;
 
-/**
- * Per-host-process client. Hot path = RAM lookup + enqueue only.
- * Translation itself lives in LiteTrans' isolated :translator process.
- */
+/** Per-host-process client. UI hot path remains RAM lookup + enqueue only. */
 public final class TranslationClient {
     private static volatile TranslationClient INSTANCE;
-
     private static final int HOST_CACHE_ENTRIES = 2048;
     private static final int MAX_BATCH = 48;
     private static final long BATCH_WINDOW_MS = 24L;
-    private static final long REQUEST_EXPIRY_MS = 20_000L;
+    private static final long REQUEST_EXPIRY_MS = 300_000L;
+    private static final long REBIND_DELAY_MS = 2_000L;
 
     private final Context appContext;
+    private final String hostPackage;
     private final Object lock = new Object();
     private final LruCache<String, String> cache = new LruCache<>(HOST_CACHE_ENTRIES);
     private final LinkedHashSet<String> queue = new LinkedHashSet<>();
     private final Map<String, List<PendingTarget>> waiters = new HashMap<>();
-
     private final HandlerThread ioThread;
     private final Handler ioHandler;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -56,11 +53,12 @@ public final class TranslationClient {
     private volatile boolean binding;
     private volatile boolean bound;
     private boolean flushScheduled;
+    private boolean rebindScheduled;
 
     private TranslationClient(Context context) {
         Context application = context.getApplicationContext();
         this.appContext = application != null ? application : context;
-
+        this.hostPackage = this.appContext.getPackageName();
         ioThread = new HandlerThread("LiteTrans-IPC", Process.THREAD_PRIORITY_BACKGROUND);
         ioThread.start();
         ioHandler = new Handler(ioThread.getLooper());
@@ -81,9 +79,7 @@ public final class TranslationClient {
     }
 
     public String peek(String source) {
-        synchronized (lock) {
-            return cache.get(source);
-        }
+        synchronized (lock) { return cache.get(source); }
     }
 
     public void request(String source, TextView view, long generation,
@@ -103,7 +99,6 @@ public final class TranslationClient {
                 scheduleFlushLocked();
             }
         }
-
         if (already != null) {
             applyAsync(new PendingTarget(view, generation, original, envelope), source, already);
             return;
@@ -140,9 +135,7 @@ public final class TranslationClient {
 
         Messenger target = service;
         if (target == null) {
-            synchronized (lock) {
-                queue.addAll(batch);
-            }
+            synchronized (lock) { queue.addAll(batch); }
             ensureBound();
             return;
         }
@@ -150,6 +143,7 @@ public final class TranslationClient {
         Message msg = Message.obtain(null, Protocol.MSG_TRANSLATE_BATCH);
         Bundle data = new Bundle();
         data.putStringArrayList(Protocol.KEY_TEXTS, batch);
+        data.putString(Protocol.KEY_HOST_PACKAGE, hostPackage);
         msg.setData(data);
         msg.replyTo = replyMessenger;
         try {
@@ -157,10 +151,8 @@ public final class TranslationClient {
         } catch (RemoteException e) {
             service = null;
             bound = false;
-            synchronized (lock) {
-                queue.addAll(batch);
-            }
-            ensureBound();
+            synchronized (lock) { queue.addAll(batch); }
+            scheduleRebind();
             return;
         }
 
@@ -172,27 +164,23 @@ public final class TranslationClient {
     private boolean handleReply(Message msg) {
         if (msg.what != Protocol.MSG_TRANSLATE_RESULT) return true;
         Bundle data = msg.getData();
-        data.setClassLoader(String.class.getClassLoader());
         ArrayList<String> sources = data.getStringArrayList(Protocol.KEY_TEXTS);
         ArrayList<String> translations = data.getStringArrayList(Protocol.KEY_TRANSLATIONS);
         if (sources == null || translations == null) return true;
-
         int count = Math.min(sources.size(), translations.size());
         for (int i = 0; i < count; i++) {
             String source = sources.get(i);
             String translated = translations.get(i);
             if (source == null) continue;
             if (translated == null || translated.isEmpty()) translated = source;
-
             final List<PendingTarget> targets;
             synchronized (lock) {
+                // Cache even unchanged results: language detection may legitimately decide OTHER.
                 cache.put(source, translated);
                 targets = waiters.remove(source);
             }
             if (targets != null) {
-                for (PendingTarget pending : targets) {
-                    applyAsync(pending, source, translated);
-                }
+                for (PendingTarget pending : targets) applyAsync(pending, source, translated);
             }
         }
         return true;
@@ -205,16 +193,14 @@ public final class TranslationClient {
             try {
                 Object gen = XposedHelpers.getAdditionalInstanceField(view, LiteTransHook.GENERATION_KEY);
                 Object currentSource = XposedHelpers.getAdditionalInstanceField(view, LiteTransHook.SOURCE_KEY);
-                if (!(gen instanceof Long) || ((Long) gen) != pending.generation) return;
+                if (!(gen instanceof Long) || ((Long) gen).longValue() != pending.generation) return;
                 if (!(currentSource instanceof String) || !source.equals(currentSource)) return;
-
+                if (translated.equals(source)) return;
                 String wrapped = pending.envelope.wrap(translated);
                 CharSequence styled = StyledText.rebuild(pending.original, wrapped);
                 XposedHelpers.setAdditionalInstanceField(view, LiteTransHook.BYPASS_KEY, Boolean.TRUE);
                 view.setText(styled);
-            } catch (Throwable ignored) {
-                // Host app stability wins over translation coverage.
-            }
+            } catch (Throwable ignored) {}
         });
     }
 
@@ -227,41 +213,43 @@ public final class TranslationClient {
                 Intent intent = new Intent();
                 intent.setComponent(new ComponentName(Protocol.MODULE_PACKAGE, Protocol.SERVICE_CLASS));
                 boolean ok = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE);
-                if (!ok) binding = false;
+                if (!ok) {
+                    binding = false;
+                    scheduleRebind();
+                }
             } catch (Throwable ignored) {
                 binding = false;
+                scheduleRebind();
             }
         }
     }
 
+    private void scheduleRebind() {
+        synchronized (this) {
+            if (rebindScheduled) return;
+            rebindScheduled = true;
+        }
+        ioHandler.postDelayed(() -> {
+            synchronized (TranslationClient.this) { rebindScheduled = false; }
+            ensureBound();
+        }, REBIND_DELAY_MS);
+    }
+
     private final ServiceConnection connection = new ServiceConnection() {
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder binder) {
+        @Override public void onServiceConnected(ComponentName name, IBinder binder) {
             service = new Messenger(binder);
             binding = false;
             bound = true;
             ioHandler.post(TranslationClient.this::flushNow);
         }
-
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
+        @Override public void onServiceDisconnected(ComponentName name) { markDead(); }
+        @Override public void onBindingDied(ComponentName name) { markDead(); }
+        @Override public void onNullBinding(ComponentName name) { markDead(); }
+        private void markDead() {
             service = null;
             binding = false;
             bound = false;
-        }
-
-        @Override
-        public void onBindingDied(ComponentName name) {
-            service = null;
-            binding = false;
-            bound = false;
-        }
-
-        @Override
-        public void onNullBinding(ComponentName name) {
-            service = null;
-            binding = false;
-            bound = false;
+            scheduleRebind();
         }
     };
 
@@ -270,7 +258,6 @@ public final class TranslationClient {
         final long generation;
         final CharSequence original;
         final TextEnvelope envelope;
-
         PendingTarget(TextView view, long generation, CharSequence original, TextEnvelope envelope) {
             this.view = new WeakReference<>(view);
             this.generation = generation;
