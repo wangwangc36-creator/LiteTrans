@@ -11,6 +11,7 @@ public final class Protocol {
     public static final int MSG_CLEAR_CACHE_RESULT = 6;
     public static final int MSG_STATS = 7;
     public static final int MSG_STATS_RESULT = 8;
+    public static final int MSG_HOOK_HELLO = 9;
 
     public static final String KEY_TEXTS = "texts";
     public static final String KEY_TRANSLATIONS = "translations";
@@ -20,6 +21,8 @@ public final class Protocol {
     public static final String KEY_BATCH_COUNT = "batch_count";
     public static final String KEY_TEXT_COUNT = "text_count";
     public static final String KEY_CHANGED_COUNT = "changed_count";
+    public static final String KEY_HOOK_COUNT = "hook_count";
+    public static final String KEY_LAST_HOOK_HOST = "last_hook_host";
     public static final String KEY_LAST_HOST = "last_host";
     public static final String KEY_LAST_SOURCE = "last_source";
     public static final String KEY_LAST_TRANSLATION = "last_translation";
