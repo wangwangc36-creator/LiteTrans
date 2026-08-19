@@ -13,6 +13,8 @@ import com.google.mlkit.common.MlKit;
 import com.litetrans.module.util.Protocol;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -28,9 +30,11 @@ public final class TranslationService extends Service {
     });
 
     private final Object statsLock = new Object();
+    private final Set<String> hookedPackages = new HashSet<>();
     private long batchCount;
     private long textCount;
     private long changedCount;
+    private String lastHookHost = "—";
     private String lastHost = "—";
     private String lastSource = "—";
     private String lastTranslation = "—";
@@ -66,7 +70,18 @@ public final class TranslationService extends Service {
             case Protocol.MSG_WARMUP: handleWarmup(msg); return true;
             case Protocol.MSG_CLEAR_CACHE: handleClearCache(msg); return true;
             case Protocol.MSG_STATS: handleStats(msg); return true;
+            case Protocol.MSG_HOOK_HELLO: handleHookHello(msg); return true;
             default: return false;
+        }
+    }
+
+    private void handleHookHello(Message msg) {
+        Bundle data = msg.getData();
+        String host = data == null ? null : data.getString(Protocol.KEY_HOST_PACKAGE);
+        if (host == null || host.trim().isEmpty()) return;
+        synchronized (statsLock) {
+            hookedPackages.add(host);
+            lastHookHost = host;
         }
     }
 
@@ -91,6 +106,8 @@ public final class TranslationService extends Service {
 
         if (!selfTest) {
             synchronized (statsLock) {
+                hookedPackages.add(finalHost);
+                lastHookHost = finalHost;
                 batchCount++;
                 textCount += texts.size();
                 lastHost = finalHost;
@@ -154,6 +171,8 @@ public final class TranslationService extends Service {
         Message response = Message.obtain(null, Protocol.MSG_STATS_RESULT);
         Bundle data = new Bundle();
         synchronized (statsLock) {
+            data.putLong(Protocol.KEY_HOOK_COUNT, hookedPackages.size());
+            data.putString(Protocol.KEY_LAST_HOOK_HOST, lastHookHost);
             data.putLong(Protocol.KEY_BATCH_COUNT, batchCount);
             data.putLong(Protocol.KEY_TEXT_COUNT, textCount);
             data.putLong(Protocol.KEY_CHANGED_COUNT, changedCount);
