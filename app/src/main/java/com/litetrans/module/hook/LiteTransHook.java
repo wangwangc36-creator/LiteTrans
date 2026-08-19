@@ -1,5 +1,6 @@
 package com.litetrans.module.hook;
 
+import android.content.Context;
 import android.text.Editable;
 import android.widget.EditText;
 import android.widget.TextView;
@@ -17,10 +18,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * Lightweight TextView hook with compatibility fallbacks.
- * Hooks only the framework TextView class; no Dex scan and no synchronous translation.
- */
+/** Lightweight TextView hook with a package-load heartbeat for diagnostics. */
 public final class LiteTransHook implements IXposedHookLoadPackage {
     static final String BYPASS_KEY = "litetrans:bypass";
     static final String GENERATION_KEY = "litetrans:generation";
@@ -30,8 +28,7 @@ public final class LiteTransHook implements IXposedHookLoadPackage {
     private static final ThreadLocal<Integer> SET_TEXT_DEPTH = new ThreadLocal<>();
 
     private static final XC_MethodHook TEXT_HOOK = new XC_MethodHook() {
-        @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        @Override protected void beforeHookedMethod(MethodHookParam param) {
             if (!(param.thisObject instanceof TextView)) return;
             if (param.args == null || param.args.length == 0 || !(param.args[0] instanceof CharSequence)) return;
 
@@ -69,15 +66,12 @@ public final class LiteTransHook implements IXposedHookLoadPackage {
                     }
                     return;
                 }
-
                 client.request(envelope.core, view, generation, original, envelope);
             } catch (Throwable ignored) {
-                // Never destabilize the host app.
             }
         }
 
-        @Override
-        protected void afterHookedMethod(MethodHookParam param) {
+        @Override protected void afterHookedMethod(MethodHookParam param) {
             if (param.args == null || param.args.length == 0 || !(param.args[0] instanceof CharSequence)) return;
             int depth = currentDepth();
             if (depth <= 1) SET_TEXT_DEPTH.remove();
@@ -90,20 +84,39 @@ public final class LiteTransHook implements IXposedHookLoadPackage {
         return value == null ? 0 : value;
     }
 
-    @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+    @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (lpparam == null || lpparam.packageName == null) return;
         if (Protocol.MODULE_PACKAGE.equals(lpparam.packageName)) return;
         if ("android".equals(lpparam.packageName)
                 || "com.android.systemui".equals(lpparam.packageName)
                 || lpparam.packageName.contains("inputmethod")) return;
 
+        // Heartbeat independent of TextView coverage. If this arrives, LSPosed injection is proven.
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.app.Application",
+                    lpparam.classLoader,
+                    "attach",
+                    Context.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Context context = (Context) param.args[0];
+                                TranslationClient.get(context).reportHookLoaded();
+                            } catch (Throwable t) {
+                                XposedBridge.log("[LiteTrans] heartbeat failed " + lpparam.packageName + ": " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log("[LiteTrans] Application.attach hook failed in " + lpparam.packageName + ": " + t);
+        }
+
         int installed = 0;
         installed += tryHook(lpparam, new Object[]{CharSequence.class, TEXT_HOOK});
         installed += tryHook(lpparam, new Object[]{CharSequence.class, TextView.BufferType.class, TEXT_HOOK});
         installed += tryHook(lpparam, new Object[]{CharSequence.class, TextView.BufferType.class,
                 boolean.class, int.class, TEXT_HOOK});
-
         XposedBridge.log("[LiteTrans] " + lpparam.packageName + " TextView setText hooks=" + installed);
     }
 
