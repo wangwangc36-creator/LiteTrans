@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="false"
@@ -23,7 +25,23 @@
             android:exported="true"
             android:process=":translator" />
 
-        <!-- Legacy Xposed metadata remains the most compatible path with current LSPosed forks. -->
+        <!-- A zero-data provider used only to grant package visibility to hooked apps. -->
+        <provider
+            android:name=".ipc.VisibilityProvider"
+            android:authorities="com.litetrans.module.visibility"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <receiver
+            android:name=".ipc.VisibilityGrantReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription" android:value="英语/西班牙语实时翻译为简体中文，流畅优先。" />
         <meta-data android:name="xposedminversion" android:value="82" />
