@@ -16,10 +16,7 @@ import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * Shared translator service. Hooked apps only perform lightweight Binder IPC; all ML work
- * remains in this module-owned process and on worker threads.
- */
+/** Shared translator + lightweight runtime diagnostics. */
 public final class TranslationService extends Service {
     private static final int MAX_BATCH = 48;
     private static final int MAX_TEXT_CHARS = 4000;
@@ -30,22 +27,22 @@ public final class TranslationService extends Service {
         return thread;
     });
 
+    private final Object statsLock = new Object();
+    private long batchCount;
+    private long textCount;
+    private long changedCount;
+    private String lastHost = "—";
+    private String lastSource = "—";
+    private String lastTranslation = "—";
+
     private volatile TranslationEngine engine;
     private volatile String initializationError;
     private Messenger messenger;
 
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
-
-        // Publish a Binder even when ML Kit initialization fails so MainActivity can report
-        // a useful error instead of remaining forever at "connecting".
         messenger = new Messenger(new Handler(Looper.getMainLooper(), this::handleMessage));
-
         try {
-            // TranslationService runs in :translator. MlKitInitProvider normally initializes
-            // only the app's default process, so explicitly initialize ML Kit here before any
-            // LanguageIdentification/Translation client is constructed.
             MlKit.initialize(getApplicationContext());
             engine = new TranslationEngine();
             workers.execute(() -> {
@@ -58,35 +55,31 @@ public final class TranslationService extends Service {
         }
     }
 
-    @Override
-    public IBinder onBind(Intent intent) {
+    @Override public IBinder onBind(Intent intent) {
         return messenger == null ? null : messenger.getBinder();
     }
 
     private boolean handleMessage(Message msg) {
         if (msg == null) return true;
         switch (msg.what) {
-            case Protocol.MSG_TRANSLATE_BATCH:
-                handleTranslate(msg);
-                return true;
-            case Protocol.MSG_WARMUP:
-                handleWarmup(msg);
-                return true;
-            case Protocol.MSG_CLEAR_CACHE:
-                handleClearCache(msg);
-                return true;
-            default:
-                return false;
+            case Protocol.MSG_TRANSLATE_BATCH: handleTranslate(msg); return true;
+            case Protocol.MSG_WARMUP: handleWarmup(msg); return true;
+            case Protocol.MSG_CLEAR_CACHE: handleClearCache(msg); return true;
+            case Protocol.MSG_STATS: handleStats(msg); return true;
+            default: return false;
         }
     }
 
     private void handleTranslate(Message msg) {
         final Messenger replyTo = msg.replyTo;
         if (replyTo == null) return;
-
         Bundle data = msg.getData();
         ArrayList<String> raw = data == null ? null : data.getStringArrayList(Protocol.KEY_TEXTS);
         if (raw == null || raw.isEmpty()) return;
+        String host = data == null ? null : data.getString(Protocol.KEY_HOST_PACKAGE);
+        if (host == null || host.isEmpty()) host = "unknown";
+        final boolean selfTest = Protocol.SELF_TEST_HOST.equals(host);
+        final String finalHost = host;
 
         final ArrayList<String> texts = new ArrayList<>(Math.min(MAX_BATCH, raw.size()));
         for (int i = 0; i < raw.size() && texts.size() < MAX_BATCH; i++) {
@@ -96,15 +89,34 @@ public final class TranslationService extends Service {
             texts.add(text);
         }
 
+        if (!selfTest) {
+            synchronized (statsLock) {
+                batchCount++;
+                textCount += texts.size();
+                lastHost = finalHost;
+                if (!texts.isEmpty()) lastSource = compact(texts.get(texts.size() - 1));
+            }
+        }
+
         workers.execute(() -> {
             TranslationEngine local = engine;
-            ArrayList<String> translations;
-            if (local == null) {
-                // Keep host apps stable if translator initialization failed. MainActivity will
-                // expose the actual failure and restarting LiteTrans will retry initialization.
-                translations = new ArrayList<>(texts);
-            } else {
-                translations = local.translateBatch(texts);
+            ArrayList<String> translations = local == null
+                    ? new ArrayList<>(texts)
+                    : local.translateBatch(texts);
+
+            if (!selfTest) {
+                synchronized (statsLock) {
+                    int count = Math.min(texts.size(), translations.size());
+                    for (int i = 0; i < count; i++) {
+                        String src = texts.get(i);
+                        String dst = translations.get(i);
+                        if (dst != null && !dst.equals(src)) changedCount++;
+                        if (i == count - 1) {
+                            lastSource = compact(src);
+                            lastTranslation = compact(dst);
+                        }
+                    }
+                }
             }
 
             Message response = Message.obtain(null, Protocol.MSG_TRANSLATE_RESULT);
@@ -127,16 +139,30 @@ public final class TranslationService extends Service {
             data.putBoolean(Protocol.KEY_OK, ok);
             if (!ok) {
                 String error = initializationError;
-                if (error == null || error.isEmpty()) {
-                    error = "模型下载失败，请检查网络后重试";
-                } else {
-                    error = "翻译服务初始化失败：" + error;
-                }
+                if (error == null || error.isEmpty()) error = "模型下载失败，请检查网络后重试";
+                else error = "翻译服务初始化失败：" + error;
                 data.putString(Protocol.KEY_ERROR, error);
             }
             response.setData(data);
             safeSend(replyTo, response);
         });
+    }
+
+    private void handleStats(Message msg) {
+        Messenger replyTo = msg.replyTo;
+        if (replyTo == null) return;
+        Message response = Message.obtain(null, Protocol.MSG_STATS_RESULT);
+        Bundle data = new Bundle();
+        synchronized (statsLock) {
+            data.putLong(Protocol.KEY_BATCH_COUNT, batchCount);
+            data.putLong(Protocol.KEY_TEXT_COUNT, textCount);
+            data.putLong(Protocol.KEY_CHANGED_COUNT, changedCount);
+            data.putString(Protocol.KEY_LAST_HOST, lastHost);
+            data.putString(Protocol.KEY_LAST_SOURCE, lastSource);
+            data.putString(Protocol.KEY_LAST_TRANSLATION, lastTranslation);
+        }
+        response.setData(data);
+        safeSend(replyTo, response);
     }
 
     private void handleClearCache(Message msg) {
@@ -154,6 +180,12 @@ public final class TranslationService extends Service {
         });
     }
 
+    private static String compact(String value) {
+        if (value == null) return "—";
+        value = value.replace('\n', ' ').trim();
+        return value.length() <= 90 ? value : value.substring(0, 90) + "…";
+    }
+
     private static String describe(Throwable t) {
         if (t == null) return "Unknown error";
         String name = t.getClass().getSimpleName();
@@ -162,14 +194,10 @@ public final class TranslationService extends Service {
     }
 
     private static void safeSend(Messenger target, Message message) {
-        try {
-            target.send(message);
-        } catch (Throwable ignored) {
-        }
+        try { target.send(message); } catch (Throwable ignored) {}
     }
 
-    @Override
-    public void onDestroy() {
+    @Override public void onDestroy() {
         workers.shutdownNow();
         TranslationEngine local = engine;
         if (local != null) local.close();
