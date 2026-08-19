@@ -24,6 +24,9 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Stamp Alpha5 UI text
+        run: sed -i 's/Alpha4/Alpha5/g' app/src/main/java/com/litetrans/module/ui/MainActivity.java
+
       - name: Lint and build debug APK
         run: gradle --no-daemon :app:lintDebug :app:assembleDebug --stacktrace
 
