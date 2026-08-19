@@ -1,0 +1,2 @@
+-keep class com.litetrans.module.hook.LiteTransHook { *; }
+-dontwarn de.robv.android.xposed.**

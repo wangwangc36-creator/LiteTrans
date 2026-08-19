@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.litetrans.module'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.litetrans.module'
+        minSdk 28
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-alpha1'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += ['/META-INF/{AL2.0,LGPL2.1}', 'META-INF/DEPENDENCIES']
+        }
+    }
+}
+
+dependencies {
+    compileOnly project(':xposed-stubs')
+
+    // Official Google ML Kit. Translation models are downloaded on demand and then run on-device.
+    implementation 'com.google.mlkit:translate:17.0.3'
+    // Bundled language-ID model: avoids a first-use network dependency just to detect en/es.
+    implementation 'com.google.mlkit:language-id:17.0.6'
+}
