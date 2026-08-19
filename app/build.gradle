@@ -10,8 +10,8 @@ android {
         applicationId 'com.litetrans.module'
         minSdk 28
         targetSdk 35
-        versionCode 1
-        versionName '0.1.0-alpha1'
+        versionCode 2
+        versionName '0.1.0-alpha2'
     }
 
     buildTypes {
@@ -39,8 +39,6 @@ android {
 dependencies {
     compileOnly project(':xposed-stubs')
 
-    // Official Google ML Kit. Translation models are downloaded on demand and then run on-device.
     implementation 'com.google.mlkit:translate:17.0.3'
-    // Bundled language-ID model: avoids a first-use network dependency just to detect en/es.
     implementation 'com.google.mlkit:language-id:17.0.6'
 }

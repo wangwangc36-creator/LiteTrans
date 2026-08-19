@@ -9,17 +9,16 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
 
+import com.google.mlkit.common.MlKit;
 import com.litetrans.module.util.Protocol;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Exported only because hooked apps run under their own UIDs and need one shared translator.
- * It exposes no files/accounts/network API; requests are bounded and translated on-device.
+ * Shared translator service. Hooked apps only perform lightweight Binder IPC; all ML work
+ * remains in this module-owned process and on worker threads.
  */
 public final class TranslationService extends Service {
     private static final int MAX_BATCH = 48;
@@ -31,20 +30,37 @@ public final class TranslationService extends Service {
         return thread;
     });
 
-    private TranslationEngine engine;
+    private volatile TranslationEngine engine;
+    private volatile String initializationError;
     private Messenger messenger;
 
     @Override
     public void onCreate() {
         super.onCreate();
-        engine = new TranslationEngine();
+
+        // Publish a Binder even when ML Kit initialization fails so MainActivity can report
+        // a useful error instead of remaining forever at "connecting".
         messenger = new Messenger(new Handler(Looper.getMainLooper(), this::handleMessage));
-        workers.execute(engine::ensureModelsReady);
+
+        try {
+            // TranslationService runs in :translator. MlKitInitProvider normally initializes
+            // only the app's default process, so explicitly initialize ML Kit here before any
+            // LanguageIdentification/Translation client is constructed.
+            MlKit.initialize(getApplicationContext());
+            engine = new TranslationEngine();
+            workers.execute(() -> {
+                TranslationEngine local = engine;
+                if (local != null) local.ensureModelsReady();
+            });
+        } catch (Throwable t) {
+            initializationError = describe(t);
+            engine = null;
+        }
     }
 
     @Override
     public IBinder onBind(Intent intent) {
-        return messenger.getBinder();
+        return messenger == null ? null : messenger.getBinder();
     }
 
     private boolean handleMessage(Message msg) {
@@ -81,7 +97,16 @@ public final class TranslationService extends Service {
         }
 
         workers.execute(() -> {
-            ArrayList<String> translations = engine.translateBatch(texts);
+            TranslationEngine local = engine;
+            ArrayList<String> translations;
+            if (local == null) {
+                // Keep host apps stable if translator initialization failed. MainActivity will
+                // expose the actual failure and restarting LiteTrans will retry initialization.
+                translations = new ArrayList<>(texts);
+            } else {
+                translations = local.translateBatch(texts);
+            }
+
             Message response = Message.obtain(null, Protocol.MSG_TRANSLATE_RESULT);
             Bundle result = new Bundle();
             result.putStringArrayList(Protocol.KEY_TEXTS, texts);
@@ -95,11 +120,20 @@ public final class TranslationService extends Service {
         final Messenger replyTo = msg.replyTo;
         if (replyTo == null) return;
         workers.execute(() -> {
-            boolean ok = engine.ensureModelsReady();
+            TranslationEngine local = engine;
+            boolean ok = local != null && local.ensureModelsReady();
             Message response = Message.obtain(null, Protocol.MSG_WARMUP_RESULT);
             Bundle data = new Bundle();
             data.putBoolean(Protocol.KEY_OK, ok);
-            if (!ok) data.putString(Protocol.KEY_ERROR, "模型下载失败，请检查网络后重试");
+            if (!ok) {
+                String error = initializationError;
+                if (error == null || error.isEmpty()) {
+                    error = "模型下载失败，请检查网络后重试";
+                } else {
+                    error = "翻译服务初始化失败：" + error;
+                }
+                data.putString(Protocol.KEY_ERROR, error);
+            }
             response.setData(data);
             safeSend(replyTo, response);
         });
@@ -108,7 +142,8 @@ public final class TranslationService extends Service {
     private void handleClearCache(Message msg) {
         final Messenger replyTo = msg.replyTo;
         workers.execute(() -> {
-            engine.clearCache();
+            TranslationEngine local = engine;
+            if (local != null) local.clearCache();
             if (replyTo != null) {
                 Message response = Message.obtain(null, Protocol.MSG_CLEAR_CACHE_RESULT);
                 Bundle data = new Bundle();
@@ -117,6 +152,13 @@ public final class TranslationService extends Service {
                 safeSend(replyTo, response);
             }
         });
+    }
+
+    private static String describe(Throwable t) {
+        if (t == null) return "Unknown error";
+        String name = t.getClass().getSimpleName();
+        String message = t.getMessage();
+        return message == null || message.trim().isEmpty() ? name : name + ": " + message;
     }
 
     private static void safeSend(Messenger target, Message message) {
@@ -129,7 +171,9 @@ public final class TranslationService extends Service {
     @Override
     public void onDestroy() {
         workers.shutdownNow();
-        if (engine != null) engine.close();
+        TranslationEngine local = engine;
+        if (local != null) local.close();
+        engine = null;
         super.onDestroy();
     }
 }

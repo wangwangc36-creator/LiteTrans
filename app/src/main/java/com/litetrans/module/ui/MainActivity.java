@@ -25,8 +25,10 @@ import com.litetrans.module.util.Protocol;
 public final class MainActivity extends Activity {
     private TextView status;
     private Button prepareButton;
+    private Button reconnectButton;
     private Messenger service;
     private boolean bound;
+    private boolean binding;
 
     private final Messenger replyMessenger = new Messenger(
             new Handler(Looper.getMainLooper(), this::handleReply));
@@ -48,8 +50,7 @@ public final class MainActivity extends Activity {
         scroll.addView(root, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("LiteTrans", 30, true);
-        root.addView(title);
+        root.addView(text("LiteTrans", 30, true));
 
         TextView subtitle = text("英语 / 西班牙语 → 简体中文", 18, true);
         subtitle.setPadding(0, dp(8), 0, dp(4));
@@ -73,6 +74,14 @@ public final class MainActivity extends Activity {
         buttonParams.topMargin = dp(12);
         root.addView(prepareButton, buttonParams);
 
+        reconnectButton = new Button(this);
+        reconnectButton.setText("重新连接翻译服务");
+        reconnectButton.setOnClickListener(v -> bindTranslator());
+        LinearLayout.LayoutParams reconnectParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        reconnectParams.topMargin = dp(8);
+        root.addView(reconnectButton, reconnectParams);
+
         Button clear = new Button(this);
         clear.setText("清空 LiteTrans 内存缓存");
         clear.setOnClickListener(v -> clearCache());
@@ -93,7 +102,7 @@ public final class MainActivity extends Activity {
                 "• 两级 RAM 缓存：目标 App 进程 + 翻译服务进程。\n" +
                 "• RecyclerView 复用使用 generation 校验，过期结果直接丢弃。\n" +
                 "• 不扫描 Dex、不 Hook StaticLayout、不写 SQLite 热路径。\n\n" +
-                "当前 Alpha 版重点覆盖标准 Android TextView。Jetpack Compose / WebView 会在实机确认流畅度后单独适配。",
+                "Alpha2 增加翻译服务次进程 ML Kit 显式初始化与连接错误提示。",
                 15, false);
         steps.setPadding(0, dp(22), 0, dp(18));
         root.addView(steps);
@@ -116,29 +125,65 @@ public final class MainActivity extends Activity {
     }
 
     private void bindTranslator() {
+        if (bound || binding) return;
+        status.setText("正在连接翻译服务…");
+        prepareButton.setEnabled(false);
+        reconnectButton.setEnabled(false);
+
         Intent intent = new Intent(this, TranslationService.class);
         try {
-            bindService(intent, connection, Context.BIND_AUTO_CREATE);
+            boolean accepted = bindService(intent, connection, Context.BIND_AUTO_CREATE);
+            binding = accepted;
+            if (!accepted) {
+                reconnectButton.setEnabled(true);
+                status.setText("翻译服务连接失败：bindService() 返回 false");
+            }
         } catch (Throwable t) {
-            status.setText("翻译服务连接失败：" + t.getClass().getSimpleName());
+            binding = false;
+            reconnectButton.setEnabled(true);
+            status.setText("翻译服务连接失败：" + t.getClass().getSimpleName() +
+                    (t.getMessage() == null ? "" : "\n" + t.getMessage()));
         }
+    }
+
+    private void markDisconnected(String message) {
+        service = null;
+        binding = false;
+        bound = false;
+        prepareButton.setEnabled(false);
+        reconnectButton.setEnabled(true);
+        status.setText(message);
     }
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
+            binding = false;
+            if (binder == null) {
+                markDisconnected("翻译服务连接失败：Binder 为空");
+                return;
+            }
             service = new Messenger(binder);
             bound = true;
+            reconnectButton.setEnabled(false);
             prepareButton.setEnabled(true);
+            status.setText("✓ 翻译服务已连接，正在准备模型…");
             warmup();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
-            service = null;
-            bound = false;
-            prepareButton.setEnabled(false);
-            status.setText("翻译服务已断开");
+            markDisconnected("翻译服务已断开，请点“重新连接翻译服务”");
+        }
+
+        @Override
+        public void onBindingDied(ComponentName name) {
+            markDisconnected("翻译服务进程异常退出，请点“重新连接翻译服务”");
+        }
+
+        @Override
+        public void onNullBinding(ComponentName name) {
+            markDisconnected("翻译服务返回空 Binder，请重新安装或重启 LiteTrans");
         }
     };
 
@@ -146,6 +191,7 @@ public final class MainActivity extends Activity {
         Messenger target = service;
         if (target == null) {
             status.setText("翻译服务尚未连接");
+            reconnectButton.setEnabled(true);
             return;
         }
         status.setText("正在准备 Google 英语 / 西班牙语 / 中文模型…\n首次下载需要联网，之后可离线使用。");
@@ -155,19 +201,22 @@ public final class MainActivity extends Activity {
         try {
             target.send(msg);
         } catch (RemoteException e) {
-            status.setText("模型准备请求发送失败，请重试");
-            prepareButton.setEnabled(true);
+            markDisconnected("模型准备请求发送失败：翻译服务已断开");
         }
     }
 
     private void clearCache() {
         Messenger target = service;
-        if (target == null) return;
+        if (target == null) {
+            status.setText("翻译服务尚未连接");
+            return;
+        }
         Message msg = Message.obtain(null, Protocol.MSG_CLEAR_CACHE);
         msg.replyTo = replyMessenger;
         try {
             target.send(msg);
-        } catch (RemoteException ignored) {
+        } catch (RemoteException e) {
+            markDisconnected("清理缓存失败：翻译服务已断开");
         }
     }
 
@@ -192,9 +241,11 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (bound) {
+        if (bound || binding) {
             try { unbindService(connection); } catch (Throwable ignored) {}
         }
+        bound = false;
+        binding = false;
         super.onDestroy();
     }
 
