@@ -28,7 +28,6 @@ import java.util.List;
 import java.util.Map;
 
 import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
 
 /** Per-host-process client. UI hot path remains RAM lookup + enqueue only. */
 public final class TranslationClient {
@@ -80,7 +79,6 @@ public final class TranslationClient {
         return local;
     }
 
-    /** Called once from Application.attach so diagnostics can distinguish injection from text coverage. */
     public void reportHookLoaded() {
         synchronized (this) { helloRequested = true; }
         ensureBound();
@@ -217,18 +215,28 @@ public final class TranslationClient {
     private void applyAsync(PendingTarget pending, String source, String translated) {
         mainHandler.post(() -> {
             TextView view = pending.view.get();
-            if (view == null) return;
+            if (view == null || translated.equals(source)) return;
+            LiteTransHook.ViewState state = LiteTransHook.stateFor(view);
             try {
-                Object gen = XposedHelpers.getAdditionalInstanceField(view, LiteTransHook.GENERATION_KEY);
-                Object currentSource = XposedHelpers.getAdditionalInstanceField(view, LiteTransHook.SOURCE_KEY);
-                if (!(gen instanceof Long) || ((Long) gen).longValue() != pending.generation) return;
-                if (!(currentSource instanceof String) || !source.equals(currentSource)) return;
-                if (translated.equals(source)) return;
+                synchronized (state) {
+                    if (state.generation != pending.generation) return;
+                    if (state.source == null || !source.equals(state.source)) return;
+                    state.bypass = true;
+                }
+
                 String wrapped = pending.envelope.wrap(translated);
                 CharSequence styled = StyledText.rebuild(pending.original, wrapped);
-                XposedHelpers.setAdditionalInstanceField(view, LiteTransHook.BYPASS_KEY, Boolean.TRUE);
                 view.setText(styled);
-            } catch (Throwable ignored) {}
+
+                // The hooked setText call normally clears bypass synchronously. Clear defensively
+                // if a ROM/framework path bypasses the hook.
+                synchronized (state) {
+                    if (state.bypass) state.bypass = false;
+                }
+            } catch (Throwable t) {
+                synchronized (state) { state.bypass = false; }
+                XposedBridge.log("[LiteTrans] apply translation failed host=" + hostPackage + ": " + t);
+            }
         });
     }
 
