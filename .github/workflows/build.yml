@@ -24,8 +24,8 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Stamp Alpha5 UI text
-        run: sed -i 's/Alpha4/Alpha5/g' app/src/main/java/com/litetrans/module/ui/MainActivity.java
+      - name: Stamp Alpha6 UI text
+        run: sed -i 's/Alpha4/Alpha6/g; s/Alpha5/Alpha6/g' app/src/main/java/com/litetrans/module/ui/MainActivity.java
 
       - name: Lint and build debug APK
         run: gradle --no-daemon :app:lintDebug :app:assembleDebug --stacktrace
@@ -33,6 +33,6 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: LiteTrans-0.1.0-alpha5-debug
+          name: LiteTrans-0.1.0-alpha6-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
