@@ -1,0 +1,54 @@
+name: Build LiteTrans alpha7 Compose
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ alpha7-compose ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore baseline source
+        shell: bash
+        run: |
+          awk '/cat > \/tmp\/litetrans-source.b64/{flag=1;next} /LITETRANS_EOF/{if(flag){exit}} flag {sub(/^          /, ""); print}' .github/workflows/build.yml > /tmp/litetrans-source.b64
+          base64 -d /tmp/litetrans-source.b64 > /tmp/LiteTrans-source.zip
+          rm -rf /tmp/litetrans-src
+          mkdir -p /tmp/litetrans-src
+          unzip -q /tmp/LiteTrans-source.zip -d /tmp/litetrans-src
+          rsync -a --exclude='.github' /tmp/litetrans-src/LiteTrans/ ./
+
+      - name: Apply alpha7 Compose patch
+        shell: bash
+        run: |
+          base64 -d .github/alpha7-patch.py.gz.b64 | gzip -d > /tmp/alpha7-patch.py
+          sed -i "s#root=Path('/mnt/data/LiteTrans-src/LiteTrans')#root=Path('.')#" /tmp/alpha7-patch.py
+          python3 /tmp/alpha7-patch.py
+          sed -i 's/newFixedThreadPool(3/newFixedThreadPool(2/' app/src/main/java/com/litetrans/module/service/TranslationService.java
+          grep -n "versionCode\|versionName" app/build.gradle
+          grep -n "Compose hooks\|newFixedThreadPool" app/src/main/java/com/litetrans/module/hook/ComposeHook.java app/src/main/java/com/litetrans/module/service/TranslationService.java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteTrans-0.1.0-alpha7-compose-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
